@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+langchain-core
+langchain-groq
+pinecone
+openai
+requests
