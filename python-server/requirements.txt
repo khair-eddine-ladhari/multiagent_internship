@@ -1,0 +1,8 @@
+crewai
+litellm
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+pymongo
+requests
