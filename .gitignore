@@ -1,44 +1,59 @@
-# --- Environment / secrets ---
+# === Environment / Secrets ===
 .env
 .env.*
 !.env.example
+**/.env
+**/.env.*
+!**/.env.example
 
-# --- Python ---
+# === Python ===
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-
-# --- Virtual environments ---
+.venv/
 venv/
 env/
-.venv/
 ENV/
-
-# --- Packaging / build ---
-build/
-dist/
 *.egg-info/
-.eggs/
-
-# --- Testing / coverage ---
 .pytest_cache/
-.coverage
-htmlcov/
+.mypy_cache/
+.ruff_cache/
+pip-log.txt
 
-# --- CrewAI / LiteLLM local caches (if any) ---
-.crewai/
-.litellm_cache/
+# === Node ===
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+.npm/
 
-# --- IDE / editor ---
+# === IDE / Editor ===
 .vscode/
 .idea/
 *.swp
+*.swo
 
-# --- OS ---
+# === OS ===
 .DS_Store
 Thumbs.db
 
-# --- Logs ---
+# === Logs ===
 *.log
+logs/
+
+# === Screenshots / temp images ===
+Capture d'écran*.png
+d.png
+
+# === Database ===
+*.sqlite3
+*.db
+
+# === Build / dist ===
+dist/
+build/
+*.egg
