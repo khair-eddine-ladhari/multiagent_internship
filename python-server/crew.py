@@ -1,12 +1,29 @@
 """
 crew.py
 -------
-Replaces the old flow.py + agent.py orchestration with a CrewAI crew:
+Runs product search directly in Python (no LLM agent in the loop for
+search), then hands the raw, guaranteed-verbatim results to a single
+CrewAI comparator agent that does the actual reasoning (compare +
+recommend).
 
-  - 3 search agents (Store A, Store B, Store C), each using its matching
-    tool from search_tools.py
-  - 1 comparator/reporter agent that takes all three results and produces
-    the final comparison + recommendation
+WHY NOT THREE SEARCH AGENTS ANYMORE:
+The previous version used a separate LLM agent per store, each with
+one tool. The tool calls always worked and always returned real data
+— but CrewAI only forwards a task's *Final Answer text* to downstream
+tasks via `context`, not the raw tool output. The 8B search model
+would intermittently write a lazy Final Answer like "results are
+shown above" or "some products match" instead of literally copying
+the tool's output — so the comparator would receive near-empty input
+for that store and correctly (from its point of view) report "no
+data," even though the store actually had real products the whole
+time. This was confirmed directly in the CLI trace: tool output was
+always populated, but the agent's Final Answer sometimes wasn't.
+
+Since the search step does no reasoning at all (call one tool, relay
+its text), there's no reason to route it through an LLM turn that can
+drop data. Calling the tools directly in Python removes that failure
+mode completely — the comparator now always receives exactly what
+SerpApi returned, with no lossy paraphrase step in between.
 
 Entry point: run_product_search(query) -> str
 """
@@ -14,7 +31,12 @@ Entry point: run_product_search(query) -> str
 import os
 import litellm
 from crewai import Agent, Task, Crew, Process, LLM
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
+from litellm.exceptions import RateLimitError
 
+# Call the underlying (non-@tool-wrapped) search functions directly.
+# .func unwraps CrewAI's @tool decorator so we can call them as plain
+# Python functions without going through an agent/LLM turn.
 from search_tools import search_store_a, search_store_b, search_store_c
 
 # Groq's API rejects request params it doesn't recognize. This alone
@@ -22,10 +44,9 @@ from search_tools import search_store_a, search_store_b, search_store_c
 # top-level request params, not fields injected into message dicts.
 litellm.drop_params = True
 
-# Groq's free tier has a tight tokens-per-minute (TPM) budget, and this
-# crew makes several LLM calls per request (one per agent). Rather than
-# letting a transient RateLimitError crash the whole /flow request,
-# have LiteLLM automatically retry with exponential backoff.
+# Groq's free tier has a tight tokens-per-minute (TPM) budget. Retry
+# transient RateLimitErrors with exponential backoff rather than
+# letting them crash the /flow request.
 litellm.num_retries = 3
 
 # Known CrewAI bug (crewAIInc/crewAI#5886): newer CrewAI versions
@@ -45,112 +66,98 @@ except ImportError:
     pass
 
 
-def _llm() -> LLM:
-    """Groq-backed LLM for all agents in the crew."""
+def _llm(model: str | None = None, max_tokens: int = 1600) -> LLM:
+    """Groq-backed LLM factory, used only for the comparator agent now."""
     return LLM(
-        model=os.environ.get("GROQ_MODEL", "groq/llama-3.3-70b-versatile"),
+        model=model or os.environ.get("GROQ_MODEL", "groq/llama-3.3-70b-versatile"),
         api_key=os.environ.get("GROQ_API_KEY"),
+        max_tokens=max_tokens,
+        temperature=0.3,
     )
 
 
-def build_crew(query: str) -> Crew:
-    llm = _llm()
+def _run_searches(query: str) -> dict[str, str]:
+    """
+    Call all three store search tools directly in Python.
 
-    store_a_agent = Agent(
-        role="Store A Search Specialist",
-        goal=f"Find the best matching products for '{query}' in Store A.",
-        backstory="You are a focused product researcher who only searches Store A "
-                   "and reports exactly what you find, including when Store A has no data.",
-        tools=[search_store_a],
-        llm=llm,
-        verbose=True,
-    )
+    Returns the raw text each tool produced, unmodified. This is the
+    exact text that used to get lost or paraphrased away by the
+    per-store search agents — now it goes straight to the comparator
+    with no LLM turn in between to drop it.
+    """
+    return {
+        "Store A (Amazon)": search_store_a.func(query),
+        "Store B (eBay)": search_store_b.func(query),
+        "Store C (Walmart)": search_store_c.func(query),
+    }
 
-    store_b_agent = Agent(
-        role="Store B Search Specialist",
-        goal=f"Find the best matching products for '{query}' in Store B.",
-        backstory="You are a focused product researcher who only searches Store B "
-                   "and reports exactly what you find, including when Store B has no data.",
-        tools=[search_store_b],
-        llm=llm,
-        verbose=True,
-    )
 
-    store_c_agent = Agent(
-        role="Store C Search Specialist",
-        goal=f"Find the best matching products for '{query}' in Store C.",
-        backstory="You are a focused product researcher who only searches Store C "
-                   "and reports exactly what you find, including when Store C has no data.",
-        tools=[search_store_c],
-        llm=llm,
-        verbose=True,
-    )
+def build_crew(query: str, search_results: dict[str, str]) -> Crew:
+    compare_llm = _llm(os.environ.get("GROQ_MODEL", "groq/llama-3.3-70b-versatile"), max_tokens=1000)
 
     comparator_agent = Agent(
         role="Product Comparator & Reporter",
         goal="Compare products found across Store A, B, and C and recommend the best option.",
         backstory="You are a meticulous shopping advisor. You never invent products or "
-                   "prices that weren't reported to you. If a store had no data, you say so "
-                   "instead of guessing.",
-        llm=llm,
+                   "prices that weren't given to you. If a store had no data, you say so "
+                   "instead of guessing. If a store's report contains obviously fake "
+                   "placeholder data (e.g. generic names like 'Product 1' or made-up domains "
+                   "like 'storea.com'), you treat that store as having no real data rather "
+                   "than including it in your comparison.",
+        llm=compare_llm,
         verbose=True,
+        max_iter=1,  # no tools to call — should answer in a single pass
     )
 
-    task_a = Task(
-        description=f"Search Store A for: '{query}'. Report all products found with "
-                     f"title, price, and link. If Store A is unavailable or empty, say so plainly.",
-        expected_output="A list of products from Store A, each with title, price, and the "
-                         "full product link copied exactly as given by the search tool "
-                         "(or a clear 'no data' statement).",
-        agent=store_a_agent,
-    )
-
-    task_b = Task(
-        description=f"Search Store B for: '{query}'. Report all products found with "
-                     f"title, price, and link. If Store B is unavailable or empty, say so plainly.",
-        expected_output="A list of products from Store B, each with title, price, and the "
-                         "full product link copied exactly as given by the search tool "
-                         "(or a clear 'no data' statement).",
-        agent=store_b_agent,
-    )
-
-    task_c = Task(
-        description=f"Search Store C for: '{query}'. Report all products found with "
-                     f"title, price, and link. If Store C is unavailable or empty, say so plainly.",
-        expected_output="A list of products from Store C, each with title, price, and the "
-                         "full product link copied exactly as given by the search tool "
-                         "(or a clear 'no data' statement).",
-        agent=store_c_agent,
+    results_block = "\n\n".join(
+        f"{store}:\n{text}" for store, text in search_results.items()
     )
 
     compare_task = Task(
-        description="Using the results from Store A, Store B, and Store C, compare the "
-                     "products by price and relevance to the original query: "
-                     f"'{query}'. Recommend the single best option and explain why. "
-                     "If all stores returned no data, say clearly that no products were found "
-                     "rather than fabricating a recommendation. "
-                     "IMPORTANT: every product link from the store reports must be preserved "
-                     "and shown in full in your output — never omit, shorten, or replace a "
-                     "link with just the product name.",
+        description=(
+            "Here are the RAW, VERBATIM search results already retrieved from Store A, "
+            "Store B, and Store C. Do not call any tools — these results are final and "
+            "complete:\n\n"
+            f"{results_block}\n\n"
+            f"Compare these products by price and relevance to the original query: "
+            f"'{query}'. Recommend the single best option and explain why. "
+            "If a store's block above says it has no data, treat that store as having no "
+            "data — do not invent products for it. If all stores have no data, say clearly "
+            "that no products were found rather than fabricating a recommendation. "
+            "Any store block containing obviously placeholder/fake data (generic names, "
+            "made-up domains) must be treated as 'no data' and excluded from the table. "
+            "IMPORTANT: every product link shown above must be preserved and shown in full "
+            "in your output — never omit, shorten, or replace a link with just the product "
+            "name."
+        ),
         expected_output="A markdown comparison table with columns: Store, Product, Price, "
                          "Link, Key Features — where Link is the full clickable URL for each "
-                         "product exactly as reported by the store agents. Follow the table "
-                         "with one clear final recommendation that also includes its link "
-                         "(or a clear 'no products found' statement if all stores were empty).",
+                         "product exactly as given above. Follow the table with one clear "
+                         "final recommendation that also includes its link (or a clear "
+                         "'no products found' statement if all stores were empty).",
         agent=comparator_agent,
-        context=[task_a, task_b, task_c],
     )
 
     return Crew(
-        agents=[store_a_agent, store_b_agent, store_c_agent, comparator_agent],
-        tasks=[task_a, task_b, task_c, compare_task],
+        agents=[comparator_agent],
+        tasks=[compare_task],
         process=Process.sequential,
         verbose=True,
     )
 
 
+@retry(
+    retry=retry_if_exception_type(RateLimitError),
+    wait=wait_exponential(multiplier=1, min=2, max=20),
+    stop=stop_after_attempt(5),
+)
 def run_product_search(query: str) -> str:
-    """Kick off the crew for a given query and return the final report text."""
-    crew = build_crew(query)
+    """
+    Run the three store searches directly in Python (no LLM turn, so
+    no risk of an agent summarizing away real data), then let a single
+    comparator agent reason over the guaranteed-verbatim results.
+    """
+    search_results = _run_searches(query)
+    crew = build_crew(query, search_results)
     result = crew.kickoff()
     return str(result)

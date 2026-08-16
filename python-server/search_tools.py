@@ -17,19 +17,21 @@ import os
 import requests
 from crewai.tools import tool
 
+import logging
+
+logger = logging.getLogger("search_tools")
+logging.basicConfig(level=logging.INFO)
+
+
 SERPAPI_ENDPOINT = "https://serpapi.com/search"
 RESULTS_PER_STORE = 3  # fewer results = fewer tokens sent to the LLM per agent call
 
 
+
 def _serpapi_search(engine: str, query_param: str, query: str) -> list[dict]:
-    """
-    Call SerpApi for a given engine (amazon / ebay / walmart) and
-    return its list of organic results (raw dicts), or [] on any
-    failure — callers turn that into a "no data" message rather than
-    raising, so one store's outage doesn't break the whole crew run.
-    """
     api_key = os.environ.get("SERPAPI_KEY")
     if not api_key:
+        logger.warning("SERPAPI_KEY not set — returning no results for %s", engine)
         return []
 
     params = {
@@ -42,10 +44,70 @@ def _serpapi_search(engine: str, query_param: str, query: str) -> list[dict]:
         response = requests.get(SERPAPI_ENDPOINT, params=params, timeout=15)
         response.raise_for_status()
         data = response.json()
-    except (requests.RequestException, ValueError):
+    except requests.RequestException as e:
+        logger.warning("SerpApi request failed for engine=%s: %s", engine, e)
+        return []
+    except ValueError as e:
+        logger.warning("SerpApi returned invalid JSON for engine=%s: %s", engine, e)
         return []
 
-    return data.get("organic_results", [])[:RESULTS_PER_STORE]
+    if "error" in data:
+        logger.warning("SerpApi returned an error for engine=%s: %s", engine, data["error"])
+        return []
+
+    results = data.get("organic_results", [])
+    if not results:
+        logger.info("SerpApi engine=%s returned 0 organic_results for query=%r. Keys: %s",
+                     engine, query, list(data.keys()))
+
+    return results[:RESULTS_PER_STORE]
+
+
+def _normalize_price(item: dict) -> str:
+    """
+    Return a clean, LLM-safe price string regardless of which SerpApi
+    engine produced the result.
+
+    Price field shapes vary by engine and are NOT always plain strings:
+      - Amazon:  item["price"] is usually already a string, e.g. "$8.99"
+      - eBay:    item["price"] is a dict, e.g. {"raw": "$21.74", "extracted": 21.74}
+      - Walmart: item["primary_offer"]["offer_price"] is a float, e.g. 24.99
+
+    Previously, `item.get("price") or ...` would return the eBay dict
+    as-is (since a non-empty dict is truthy), and str()-interpolating
+    that dict into the report text produced garbled input like
+    "{'raw': '$21.74', 'extracted': 21.74}" — which was confusing
+    enough that the 8B search-agent model sometimes gave up and
+    reported "no products found" even though real data was present.
+
+    This function checks the *type* of each candidate field, not just
+    truthiness, so a dict or float is converted to a proper string
+    instead of ever being passed through raw.
+    """
+    price = item.get("price")
+    if isinstance(price, str) and price.strip():
+        return price.strip()
+    if isinstance(price, dict):
+        raw = price.get("raw")
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+        extracted = price.get("extracted")
+        if isinstance(extracted, (int, float)):
+            return f"${extracted}"
+
+    price_raw = item.get("price_raw")
+    if isinstance(price_raw, str) and price_raw.strip():
+        return price_raw.strip()
+
+    offer = item.get("primary_offer")
+    if isinstance(offer, dict):
+        offer_price = offer.get("offer_price")
+        if isinstance(offer_price, str) and offer_price.strip():
+            return offer_price.strip()
+        if isinstance(offer_price, (int, float)):
+            return f"${offer_price}"
+
+    return "price not listed"
 
 
 def _format_results(store_name: str, query: str, results: list[dict]) -> str:
@@ -59,13 +121,7 @@ def _format_results(store_name: str, query: str, results: list[dict]) -> str:
         if len(title) > 80:
             title = title[:77] + "..."
 
-        # Price field names differ slightly between SerpApi engines.
-        price = (
-            item.get("price")
-            or item.get("price_raw")
-            or item.get("primary_offer", {}).get("offer_price")
-            or "price not listed"
-        )
+        price = _normalize_price(item)
 
         link = item.get("link") or item.get("product_page_url") or "no link available"
 
