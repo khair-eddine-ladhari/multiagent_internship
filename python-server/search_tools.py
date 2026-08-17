@@ -110,6 +110,45 @@ def _normalize_price(item: dict) -> str:
     return "price not listed"
 
 
+def _clean_link(link: str) -> str:
+    """
+    Strip tracking/session cruft from product links before they ever
+    reach the LLM.
+
+    eBay's `link` field from SerpApi is the raw item URL *plus* a huge
+    `itmprp=enc%3A...` tracking blob (plus `_skw`, `itmmeta`, `hash`,
+    etc.), often several hundred characters long. That's not just
+    wasted tokens — it's a direct contributor to output getting
+    truncated mid-URL, since the blob alone can eat a meaningful chunk
+    of max_tokens once it's echoed back in the comparator's table.
+
+    eBay item URLs are of the form:
+        https://www.ebay.com/itm/<item_id>?<tracking params...>
+    Everything after the item ID is tracking/session data, not needed
+    to reach the listing. So for ebay.com links, rebuild just
+    `https://www.ebay.com/itm/<item_id>` and drop the query string
+    entirely. Any other domain (Amazon, Walmart) is returned unchanged,
+    since their links don't carry this bloat.
+    """
+    if not isinstance(link, str) or not link:
+        return link
+
+    if "ebay.com/itm/" in link:
+        # Item ID is the run of digits immediately after "itm/",
+        # before the query string starts.
+        after = link.split("ebay.com/itm/", 1)[1]
+        item_id = ""
+        for ch in after:
+            if ch.isdigit():
+                item_id += ch
+            else:
+                break
+        if item_id:
+            return f"https://www.ebay.com/itm/{item_id}"
+
+    return link
+
+
 def _format_results(store_name: str, query: str, results: list[dict]) -> str:
     """Turn a list of SerpApi result dicts into a short text report for the agent."""
     if not results:
@@ -124,6 +163,7 @@ def _format_results(store_name: str, query: str, results: list[dict]) -> str:
         price = _normalize_price(item)
 
         link = item.get("link") or item.get("product_page_url") or "no link available"
+        link = _clean_link(link)
 
         lines.append(f"{i}. {title} - {price} - {link}")
 

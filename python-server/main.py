@@ -3,12 +3,10 @@ main.py
 -------
 FastAPI entry point. Exposes POST /flow, called by node-client/apiClient.js.
 
-Old pipeline:   main.py -> flow.py -> agent.py -> search_tools.py (stubs)
-New pipeline:   main.py -> crew.py  -> search_tools.py (real tools)
-
-flow.py / agent.py are no longer imported anywhere in this file.
+Pipeline: main.py -> crew.py -> search_tools.py
 """
 
+import logging
 import os
 import uuid
 from typing import Any, Optional
@@ -16,8 +14,19 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI
+# Configure logging before anything else imports/uses a logger (e.g.
+# search_tools.py), so INFO/WARNING messages from tool calls and the
+# crew actually show up in the console instead of being silently
+# dropped by the default root logger config.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("main")
+
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from tenacity import RetryError
 
 from crew import run_product_search
 import memory
@@ -48,8 +57,22 @@ def flow(request: FlowRequest) -> FlowResponse:
     incoming_state = request.session_state or {}
     memory.save_session(session_id, incoming_state)
 
-    # Run the CrewAI crew: 3 store search agents -> comparator/reporter agent
-    answer = run_product_search(request.query)
+    # Run the CrewAI crew: 3 store searches (Python, no LLM) -> comparator
+    # agent. run_product_search already retries on RateLimitError internally
+    # (see crew.py); if it still exhausts all retries, tenacity re-raises as
+    # a RetryError. Catch that here so the client gets a clean 503 instead
+    # of an unhandled 500 with a raw traceback.
+    try:
+        answer = run_product_search(request.query)
+    except RetryError as e:
+        logger.error("run_product_search exhausted retries for session=%s: %s", session_id, e)
+        raise HTTPException(
+            status_code=503,
+            detail="The product search service is currently rate-limited. Please try again in a minute.",
+        )
+    except Exception as e:
+        logger.exception("run_product_search failed unexpectedly for session=%s", session_id)
+        raise HTTPException(status_code=500, detail=f"Product search failed: {e}")
 
     # Update session memory with this turn's query/answer
     memory.record_turn(session_id, query=request.query, answer=answer)
@@ -59,7 +82,7 @@ def flow(request: FlowRequest) -> FlowResponse:
     try:
         database.save_turn(session_id=session_id, query=request.query, answer=answer)
     except Exception as e:
-        print(f"[main.py] database.save_turn failed (non-fatal): {e}")
+        logger.warning("database.save_turn failed (non-fatal) for session=%s: %s", session_id, e)
 
     return FlowResponse(
         session_id=session_id,
