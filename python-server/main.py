@@ -63,7 +63,8 @@ def flow(request: FlowRequest) -> FlowResponse:
     # a RetryError. Catch that here so the client gets a clean 503 instead
     # of an unhandled 500 with a raw traceback.
     try:
-        answer = run_product_search(request.query)
+        prior_turns = incoming_state.get("turns", [])
+        answer = run_product_search(request.query, history=prior_turns)
     except RetryError as e:
         logger.error("run_product_search exhausted retries for session=%s: %s", session_id, e)
         raise HTTPException(
